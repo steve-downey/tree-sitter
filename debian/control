@@ -31,7 +31,7 @@ Description: incremental parsing system for programming tools (development files
     C) can be embedded in any application
  .
  This package contains the header files and libraries needed for developing
- with libtickit.
+ with tree-sitter.
 
 Package: libtree-sitter0
 Pre-Depends:
