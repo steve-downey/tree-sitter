@@ -15,6 +15,7 @@ Section: libdevel
 Architecture: any
 Multi-Arch: same
 Depends:
+ libtree-sitter0 (= ${binary:Version}),
  ${misc:Depends},
 Description: incremental parsing system for programming tools (development files)
  Tree-sitter is a parser generator tool and an incremental parsing library. It
