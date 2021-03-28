@@ -1,8 +1,15 @@
-tree-sitter (0.19.4-1) UNRELEASED; urgency=medium
+tree-sitter (0.19.4-1) experimental; urgency=medium
 
   * New upstream release
+  * Add missing libtree-sitter0 Depends to libtree-sitter-dev (Closes:
+    #985695)
+  * watch: Support tags with a leading "v"
+  * Bump changelog to 0.19.4-1
+  * symbols:
+    + Raise version for all APIs to 0.19 due to ABI break
+    + Add ts_query_cursor_did_exceed_match_limit, new in 0.19.2
 
- -- James McCoy <jamessan@debian.org>  Sun, 28 Mar 2021 13:27:32 -0400
+ -- James McCoy <jamessan@debian.org>  Sun, 28 Mar 2021 13:53:55 -0400
 
 tree-sitter (0.17.3-1) experimental; urgency=medium
 
