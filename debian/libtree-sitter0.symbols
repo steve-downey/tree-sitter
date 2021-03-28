@@ -81,6 +81,7 @@ libtree-sitter.so.0 libtree-sitter0 #MINVER#
  ts_query_cursor__compare_captures@Base 0.19
  ts_query_cursor__compare_nodes@Base 0.19
  ts_query_cursor_delete@Base 0.19
+ ts_query_cursor_did_exceed_match_limit@Base 0.19.2
  ts_query_cursor_exec@Base 0.19
  ts_query_cursor_new@Base 0.19
  ts_query_cursor_next_capture@Base 0.19
