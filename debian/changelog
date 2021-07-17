@@ -1,3 +1,9 @@
+tree-sitter (0.20.0-1) UNRELEASED; urgency=medium
+
+  * New upstream release
+
+ -- James McCoy <jamessan@debian.org>  Sat, 17 Jul 2021 10:27:38 -0400
+
 tree-sitter (0.19.4-1) experimental; urgency=medium
 
   * New upstream release
