@@ -36,6 +36,7 @@ libtree-sitter.so.0 libtree-sitter0 #MINVER#
  ts_node_end_byte@Base 0.19
  ts_node_end_point@Base 0.19
  ts_node_eq@Base 0.19
+ ts_node_field_name_for_child@Base 0.20
  ts_node_first_child_for_byte@Base 0.19
  ts_node_first_named_child_for_byte@Base 0.19
  ts_node_has_changes@Base 0.19
@@ -83,11 +84,13 @@ libtree-sitter.so.0 libtree-sitter0 #MINVER#
  ts_query_cursor_delete@Base 0.19
  ts_query_cursor_did_exceed_match_limit@Base 0.19.2
  ts_query_cursor_exec@Base 0.19
+ ts_query_cursor_match_limit@Base 0.20
  ts_query_cursor_new@Base 0.19
  ts_query_cursor_next_capture@Base 0.19
  ts_query_cursor_next_match@Base 0.19
  ts_query_cursor_remove_match@Base 0.19
  ts_query_cursor_set_byte_range@Base 0.19
+ ts_query_cursor_set_match_limit@Base 0.20
  ts_query_cursor_set_point_range@Base 0.19
  ts_query_delete@Base 0.19
  ts_query_disable_capture@Base 0.19
@@ -171,6 +174,7 @@ libtree-sitter.so.0 libtree-sitter0 #MINVER#
  ts_tree_cursor_delete@Base 0.19
  ts_tree_cursor_goto_first_child@Base 0.19
  ts_tree_cursor_goto_first_child_for_byte@Base 0.19
+ ts_tree_cursor_goto_first_child_for_point@Base 0.20
  ts_tree_cursor_goto_next_sibling@Base 0.19
  ts_tree_cursor_goto_parent@Base 0.19
  ts_tree_cursor_init@Base 0.19
@@ -179,10 +183,8 @@ libtree-sitter.so.0 libtree-sitter0 #MINVER#
  ts_tree_cursor_reset@Base 0.19
  ts_tree_delete@Base 0.19
  ts_tree_edit@Base 0.19
- ts_tree_get_cached_parent@Base 0.19
  ts_tree_get_changed_ranges@Base 0.19
  ts_tree_language@Base 0.19
  ts_tree_new@Base 0.19
  ts_tree_print_dot_graph@Base 0.19
  ts_tree_root_node@Base 0.19
- ts_tree_set_cached_parent@Base 0.19
