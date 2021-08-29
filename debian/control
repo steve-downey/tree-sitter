@@ -9,8 +9,8 @@ Standards-Version: 4.6.0
 Section: libs
 Homepage: https://tree-sitter.github.io/tree-sitter/
 Rules-Requires-Root: no
-Vcs-Git: https://salsa.debian.org/tree-sitter/tree-sitter.git
-Vcs-Browser: https://salsa.debian.org/tree-sitter/tree-sitter
+Vcs-Git: https://salsa.debian.org/tree-sitter-team/tree-sitter.git
+Vcs-Browser: https://salsa.debian.org/tree-sitter-team/tree-sitter
 
 Package: libtree-sitter-dev
 Section: libdevel
