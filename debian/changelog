@@ -1,8 +1,10 @@
-tree-sitter (0.20.0-2) UNRELEASED; urgency=medium
+tree-sitter (0.20.0-2) unstable; urgency=medium
 
-  * UNRELEASED
+  * Upload to unstable
+  * Declare compliance with Policy 4.6.0
+  * Fix group name in Vcs-* links
 
- -- James McCoy <jamessan@debian.org>  Sun, 29 Aug 2021 14:56:09 -0400
+ -- James McCoy <jamessan@debian.org>  Sun, 29 Aug 2021 15:04:11 -0400
 
 tree-sitter (0.20.0-1) experimental; urgency=medium
 
