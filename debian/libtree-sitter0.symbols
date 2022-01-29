@@ -1,5 +1,9 @@
 libtree-sitter.so.0 libtree-sitter0 #MINVER#
 * Build-Depends-Package: libtree-sitter-dev
+ ts_current_calloc@Base 0.20.2
+ ts_current_free@Base 0.20.2
+ ts_current_malloc@Base 0.20.2
+ ts_current_realloc@Base 0.20.2
  ts_external_scanner_state_copy@Base 0.19
  ts_external_scanner_state_data@Base 0.19
  ts_external_scanner_state_delete@Base 0.19
@@ -80,6 +84,7 @@ libtree-sitter.so.0 libtree-sitter0 #MINVER#
  ts_query__step_is_fallible@Base 0.20.1
  ts_query_capture_count@Base 0.19
  ts_query_capture_name_for_id@Base 0.19
+ ts_query_capture_quantifier_for_id@Base 0.20.3
  ts_query_cursor__compare_captures@Base 0.19
  ts_query_cursor__compare_nodes@Base 0.19
  ts_query_cursor_delete@Base 0.19
@@ -105,6 +110,7 @@ libtree-sitter.so.0 libtree-sitter0 #MINVER#
  ts_query_string_value_for_id@Base 0.19
  ts_range_array_get_changed_ranges@Base 0.19
  ts_range_array_intersects@Base 0.19
+ ts_set_allocator@Base 0.20.2
  ts_stack_can_merge@Base 0.19
  ts_stack_clear@Base 0.19
  ts_stack_copy_version@Base 0.19
@@ -117,7 +123,6 @@ libtree-sitter.so.0 libtree-sitter0 #MINVER#
  ts_stack_is_active@Base 0.19
  ts_stack_is_halted@Base 0.19
  ts_stack_is_paused@Base 0.19
- ts_stack_iterate@Base 0.19
  ts_stack_last_external_token@Base 0.19
  ts_stack_merge@Base 0.19
  ts_stack_new@Base 0.19
@@ -148,7 +153,6 @@ libtree-sitter.so.0 libtree-sitter0 #MINVER#
  ts_subtree_clone@Base 0.19
  ts_subtree_compare@Base 0.19
  ts_subtree_edit@Base 0.19
- ts_subtree_eq@Base 0.19
  ts_subtree_external_scanner_state_eq@Base 0.19
  ts_subtree_get_changed_ranges@Base 0.19
  ts_subtree_last_external_token@Base 0.19
