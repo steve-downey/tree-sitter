@@ -1,8 +1,9 @@
-tree-sitter (0.20.3-1) UNRELEASED; urgency=medium
+tree-sitter (0.20.3-1) unstable; urgency=medium
 
   * New upstream release
+  * libtree-sitter0.symbols: Add/remove functions for 0.20.3
 
- -- James McCoy <jamessan@debian.org>  Sat, 29 Jan 2022 11:48:08 -0500
+ -- James McCoy <jamessan@debian.org>  Sat, 29 Jan 2022 13:05:52 -0500
 
 tree-sitter (0.20.1-1) unstable; urgency=medium
 
