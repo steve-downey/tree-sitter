@@ -1,8 +1,8 @@
-tree-sitter (0.20.6-1) UNRELEASED; urgency=medium
+tree-sitter (0.20.6-1) unstable; urgency=medium
 
   * New upstream release
 
- -- James McCoy <jamessan@debian.org>  Mon, 28 Mar 2022 21:04:59 -0400
+ -- James McCoy <jamessan@debian.org>  Tue, 29 Mar 2022 07:18:48 -0400
 
 tree-sitter (0.20.3-1) unstable; urgency=medium
 
