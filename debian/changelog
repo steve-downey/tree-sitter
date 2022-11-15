@@ -1,8 +1,11 @@
-tree-sitter (0.20.7-1) UNRELEASED; urgency=medium
+tree-sitter (0.20.7-1) unstable; urgency=medium
 
   * New upstream release
+  * Update symbols for 0.20.7
+  * Declare compliance with Policy 4.6.1, no changes needed
+  * watch: use mode=git instead of scraping the releases page
 
- -- James McCoy <jamessan@debian.org>  Mon, 14 Nov 2022 20:38:35 -0500
+ -- James McCoy <jamessan@debian.org>  Tue, 15 Nov 2022 07:19:34 -0500
 
 tree-sitter (0.20.6-1) unstable; urgency=medium
 
