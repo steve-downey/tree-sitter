@@ -101,6 +101,7 @@ libtree-sitter.so.0 libtree-sitter0 #MINVER#
  ts_query_delete@Base 0.19
  ts_query_disable_capture@Base 0.19
  ts_query_disable_pattern@Base 0.19
+ ts_query_is_pattern_non_local@Base 0.20.8
  ts_query_is_pattern_guaranteed_at_step@Base 0.20.1
  ts_query_is_pattern_rooted@Base 0.20.7
  ts_query_new@Base 0.19
@@ -191,8 +192,9 @@ libtree-sitter.so.0 libtree-sitter0 #MINVER#
  ts_tree_delete@Base 0.19
  ts_tree_edit@Base 0.19
  ts_tree_get_changed_ranges@Base 0.19
+ ts_tree_included_ranges@Base 0.20.8
  ts_tree_language@Base 0.19
  ts_tree_new@Base 0.19
- ts_tree_print_dot_graph@Base 0.19
+ ts_tree_print_dot_graph@Base 0.20.8
  ts_tree_root_node@Base 0.19
  ts_tree_root_node_with_offset@Base 0.20.7
