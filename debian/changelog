@@ -1,8 +1,11 @@
-tree-sitter (0.20.8-1) UNRELEASED; urgency=medium
+tree-sitter (0.20.8-1) experimental; urgency=medium
 
   * New upstream release
+  * Update symbols for 0.20.8
+  * Mark all exported symbols not part of the public API as optional
+  * Declare compliance with Policy 4.6.2, no changes needed
 
- -- James McCoy <jamessan@debian.org>  Fri, 07 Apr 2023 19:44:30 -0400
+ -- James McCoy <jamessan@debian.org>  Fri, 07 Apr 2023 19:59:30 -0400
 
 tree-sitter (0.20.7-1) unstable; urgency=medium
 
