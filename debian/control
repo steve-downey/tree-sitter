@@ -4,7 +4,7 @@ Maintainer: Tree-sitter Maintainers <team+tree-sitter@tracker.debian.org>
 Uploaders:
  James McCoy <jamessan@debian.org>,
 Build-Depends:
- debhelper-compat (= 13),
+ debhelper-compat (= 12),
 Standards-Version: 4.6.2
 Section: libs
 Homepage: https://tree-sitter.github.io/tree-sitter/
