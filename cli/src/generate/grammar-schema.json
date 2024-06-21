@@ -14,6 +14,12 @@
       "pattern": "^[a-zA-Z_]\\w*"
     },
 
+    "inherits": {
+      "description": "the name of the parent grammar",
+      "type": "string",
+      "pattern": "^[a-zA-Z_]\\w*"
+    },
+
     "rules": {
       "type": "object",
       "patternProperties": {
@@ -28,6 +34,16 @@
       "type": "array",
       "items": {
         "$ref": "#/definitions/rule"
+      }
+    },
+
+    "precedences": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {
+          "$ref": "#/definitions/rule"
+        }
       }
     },
 
@@ -63,7 +79,7 @@
     },
 
     "supertypes": {
-      "description": "A list of hidden rule names that should be considered supertypes in the generated node types file. See http://tree-sitter.github.io/tree-sitter/using-parsers#static-node-types.",
+      "description": "A list of hidden rule names that should be considered supertypes in the generated node types file. See https://tree-sitter.github.io/tree-sitter/using-parsers#static-node-types.",
       "type": "array",
       "items": {
         "description": "the name of a rule in `rules` or `extras`",
@@ -105,7 +121,8 @@
           "type": "string",
           "pattern": "^PATTERN$"
         },
-        "value": { "type": "string" }
+        "value": { "type": "string" },
+        "flags": { "type": "string" }
       },
       "required": ["type", "value"]
     },
@@ -240,7 +257,10 @@
           "pattern": "^(PREC|PREC_LEFT|PREC_RIGHT|PREC_DYNAMIC)$"
         },
         "value": {
-          "type": "integer"
+          "oneof": [
+            { "type": "integer" },
+            { "type": "string" }
+          ]
         },
         "content": {
           "$ref": "#/definitions/rule"

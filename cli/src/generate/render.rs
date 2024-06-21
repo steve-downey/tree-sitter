@@ -1,13 +1,3 @@
-use super::{
-    char_tree::{CharacterTree, Comparator},
-    grammars::{ExternalToken, LexicalGrammar, SyntaxGrammar, VariableType},
-    rules::{Alias, AliasMap, Symbol, SymbolType},
-    tables::{
-        AdvanceAction, FieldLocation, GotoAction, LexState, LexTable, ParseAction, ParseTable,
-        ParseTableEntry,
-    },
-};
-use core::ops::Range;
 use std::{
     cmp,
     collections::{HashMap, HashSet},
@@ -15,7 +5,17 @@ use std::{
     mem::swap,
 };
 
-const LARGE_CHARACTER_RANGE_COUNT: usize = 8;
+use super::{
+    build_tables::Tables,
+    grammars::{ExternalToken, LexicalGrammar, SyntaxGrammar, VariableType},
+    nfa::CharacterSet,
+    rules::{Alias, AliasMap, Symbol, SymbolType},
+    tables::{
+        AdvanceAction, FieldLocation, GotoAction, LexState, LexTable, ParseAction, ParseTable,
+        ParseTableEntry,
+    },
+};
+
 const SMALL_STATE_THRESHOLD: usize = 64;
 const ABI_VERSION_MIN: usize = 13;
 const ABI_VERSION_MAX: usize = tree_sitter::LANGUAGE_VERSION;
@@ -28,7 +28,7 @@ macro_rules! add {
 }
 
 macro_rules! add_whitespace {
-    ($this: tt) => {{
+    ($this:tt) => {{
         for _ in 0..$this.indent_level {
             write!(&mut $this.buffer, "  ").unwrap();
         }
@@ -44,13 +44,13 @@ macro_rules! add_line {
 }
 
 macro_rules! indent {
-    ($this: tt) => {
+    ($this:tt) => {
         $this.indent_level += 1;
     };
 }
 
 macro_rules! dedent {
-    ($this: tt) => {
+    ($this:tt) => {
         assert_ne!($this.indent_level, 0);
         $this.indent_level -= 1;
     };
@@ -63,6 +63,8 @@ struct Generator {
     parse_table: ParseTable,
     main_lex_table: LexTable,
     keyword_lex_table: LexTable,
+    large_character_sets: Vec<(Option<Symbol>, CharacterSet)>,
+    large_character_set_info: Vec<LargeCharacterSetInfo>,
     large_state_count: usize,
     keyword_capture_token: Option<Symbol>,
     syntax_grammar: SyntaxGrammar,
@@ -79,16 +81,9 @@ struct Generator {
     abi_version: usize,
 }
 
-struct TransitionSummary {
-    is_included: bool,
-    ranges: Vec<Range<char>>,
-    call_id: Option<usize>,
-}
-
 struct LargeCharacterSetInfo {
-    ranges: Vec<Range<char>>,
-    symbol: Symbol,
-    index: usize,
+    constant_name: String,
+    is_used: bool,
 }
 
 impl Generator {
@@ -118,17 +113,30 @@ impl Generator {
             self.add_primary_state_id_list();
         }
 
+        let buffer_offset_before_lex_functions = self.buffer.len();
+
         let mut main_lex_table = LexTable::default();
         swap(&mut main_lex_table, &mut self.main_lex_table);
-        self.add_lex_function("ts_lex", main_lex_table, true);
+        self.add_lex_function("ts_lex", main_lex_table);
 
         if self.keyword_capture_token.is_some() {
             let mut keyword_lex_table = LexTable::default();
             swap(&mut keyword_lex_table, &mut self.keyword_lex_table);
-            self.add_lex_function("ts_lex_keywords", keyword_lex_table, false);
+            self.add_lex_function("ts_lex_keywords", keyword_lex_table);
         }
 
+        // Once the lex functions are generated, and we've determined which large
+        // character sets are actually used, we can generate the large character set
+        // constants. Insert them into the output buffer before the lex functions.
+        let lex_functions = self.buffer[buffer_offset_before_lex_functions..].to_string();
+        self.buffer.truncate(buffer_offset_before_lex_functions);
+        for ix in 0..self.large_character_sets.len() {
+            self.add_character_set(ix);
+        }
+        self.buffer.push_str(&lex_functions);
+
         self.add_lex_modes_list();
+        self.add_parse_table();
 
         if !self.syntax_grammar.external_tokens.is_empty() {
             self.add_external_token_enum();
@@ -136,7 +144,6 @@ impl Generator {
             self.add_external_scanner_states_list();
         }
 
-        self.add_parse_table();
         self.add_parser_export();
 
         self.buffer
@@ -152,54 +159,56 @@ impl Generator {
             self.symbol_ids[&Symbol::end()].clone(),
         );
 
-        self.symbol_map = self
-            .parse_table
-            .symbols
-            .iter()
-            .map(|symbol| {
-                let mut mapping = symbol;
+        self.symbol_map = HashMap::new();
 
-                // There can be multiple symbols in the grammar that have the same name and kind,
-                // due to simple aliases. When that happens, ensure that they map to the same
-                // public-facing symbol. If one of the symbols is not aliased, choose that one
-                // to be the public-facing symbol. Otherwise, pick the symbol with the lowest
-                // numeric value.
-                if let Some(alias) = self.default_aliases.get(symbol) {
-                    let kind = alias.kind();
-                    for other_symbol in &self.parse_table.symbols {
-                        if let Some(other_alias) = self.default_aliases.get(other_symbol) {
-                            if other_symbol < mapping && other_alias == alias {
-                                mapping = other_symbol;
+        for symbol in &self.parse_table.symbols {
+            let mut mapping = symbol;
+
+            // There can be multiple symbols in the grammar that have the same name and kind,
+            // due to simple aliases. When that happens, ensure that they map to the same
+            // public-facing symbol. If one of the symbols is not aliased, choose that one
+            // to be the public-facing symbol. Otherwise, pick the symbol with the lowest
+            // numeric value.
+            if let Some(alias) = self.default_aliases.get(symbol) {
+                let kind = alias.kind();
+                for other_symbol in &self.parse_table.symbols {
+                    if let Some(other_alias) = self.default_aliases.get(other_symbol) {
+                        if other_symbol < mapping && other_alias == alias {
+                            mapping = other_symbol;
+                        }
+                    } else if self.metadata_for_symbol(*other_symbol) == (&alias.value, kind) {
+                        mapping = other_symbol;
+                        break;
+                    }
+                }
+            }
+            // Two anonymous tokens with different flags but the same string value
+            // should be represented with the same symbol in the public API. Examples:
+            // * "<" and token(prec(1, "<"))
+            // * "(" and token.immediate("(")
+            else if symbol.is_terminal() {
+                let metadata = self.metadata_for_symbol(*symbol);
+                for other_symbol in &self.parse_table.symbols {
+                    let other_metadata = self.metadata_for_symbol(*other_symbol);
+                    if other_metadata == metadata {
+                        if let Some(mapped) = self.symbol_map.get(other_symbol) {
+                            if mapped == symbol {
+                                break;
                             }
-                        } else if self.metadata_for_symbol(*other_symbol) == (&alias.value, kind) {
-                            mapping = other_symbol;
-                            break;
                         }
+                        mapping = other_symbol;
+                        break;
                     }
                 }
-                // Two anonymous tokens with different flags but the same string value
-                // should be represented with the same symbol in the public API. Examples:
-                // *  "<" and token(prec(1, "<"))
-                // *  "(" and token.immediate("(")
-                else if symbol.is_terminal() {
-                    let metadata = self.metadata_for_symbol(*symbol);
-                    for other_symbol in &self.parse_table.symbols {
-                        let other_metadata = self.metadata_for_symbol(*other_symbol);
-                        if other_metadata == metadata {
-                            mapping = other_symbol;
-                            break;
-                        }
-                    }
-                }
+            }
 
-                (*symbol, *mapping)
-            })
-            .collect();
+            self.symbol_map.insert(*symbol, *mapping);
+        }
 
         for production_info in &self.parse_table.production_infos {
             // Build a list of all field names
             for field_name in production_info.field_map.keys() {
-                if let Err(i) = self.field_names.binary_search(&field_name) {
+                if let Err(i) = self.field_names.binary_search(field_name) {
                     self.field_names.insert(i, field_name.clone());
                 }
             }
@@ -207,36 +216,54 @@ impl Generator {
             for alias in &production_info.alias_sequence {
                 // Generate a mapping from aliases to C identifiers.
                 if let Some(alias) = &alias {
-                    let existing_symbol = self.parse_table.symbols.iter().cloned().find(|symbol| {
-                        if let Some(default_alias) = self.default_aliases.get(symbol) {
-                            default_alias == alias
-                        } else {
-                            let (name, kind) = self.metadata_for_symbol(*symbol);
-                            name == alias.value && kind == alias.kind()
-                        }
+                    let existing_symbol = self.parse_table.symbols.iter().copied().find(|symbol| {
+                        self.default_aliases.get(symbol).map_or_else(
+                            || {
+                                let (name, kind) = self.metadata_for_symbol(*symbol);
+                                name == alias.value && kind == alias.kind()
+                            },
+                            |default_alias| default_alias == alias,
+                        )
                     });
 
                     // Some aliases match an existing symbol in the grammar.
-                    let alias_id;
-                    if let Some(existing_symbol) = existing_symbol {
-                        alias_id = self.symbol_ids[&self.symbol_map[&existing_symbol]].clone();
+                    let alias_id = if let Some(existing_symbol) = existing_symbol {
+                        self.symbol_ids[&self.symbol_map[&existing_symbol]].clone()
                     }
-                    // Other aliases don't match any existing symbol, and need their own identifiers.
+                    // Other aliases don't match any existing symbol, and need their own
+                    // identifiers.
                     else {
                         if let Err(i) = self.unique_aliases.binary_search(alias) {
                             self.unique_aliases.insert(i, alias.clone());
                         }
 
-                        alias_id = if alias.is_named {
+                        if alias.is_named {
                             format!("alias_sym_{}", self.sanitize_identifier(&alias.value))
                         } else {
                             format!("anon_alias_sym_{}", self.sanitize_identifier(&alias.value))
-                        };
-                    }
+                        }
+                    };
 
                     self.alias_ids.entry(alias.clone()).or_insert(alias_id);
                 }
             }
+        }
+
+        for (ix, (symbol, _)) in self.large_character_sets.iter().enumerate() {
+            let count = self.large_character_sets[0..ix]
+                .iter()
+                .filter(|(sym, _)| sym == symbol)
+                .count()
+                + 1;
+            let constant_name = if let Some(symbol) = symbol {
+                format!("{}_character_set_{}", self.symbol_ids[symbol], count)
+            } else {
+                format!("extras_character_set_{}", count)
+            };
+            self.large_character_set_info.push(LargeCharacterSetInfo {
+                constant_name,
+                is_used: false,
+            });
         }
 
         // Determine which states should use the "small state" representation, and which should
@@ -254,13 +281,12 @@ impl Generator {
     }
 
     fn add_includes(&mut self) {
-        add_line!(self, "#include <tree_sitter/parser.h>");
+        add_line!(self, "#include \"tree_sitter/parser.h\"");
         add_line!(self, "");
     }
 
     fn add_pragmas(&mut self) {
         add_line!(self, "#if defined(__GNUC__) || defined(__clang__)");
-        add_line!(self, "#pragma GCC diagnostic push");
         add_line!(
             self,
             "#pragma GCC diagnostic ignored \"-Wmissing-field-initializers\""
@@ -314,7 +340,7 @@ impl Generator {
             "#define SYMBOL_COUNT {}",
             self.parse_table.symbols.len()
         );
-        add_line!(self, "#define ALIAS_COUNT {}", self.unique_aliases.len(),);
+        add_line!(self, "#define ALIAS_COUNT {}", self.unique_aliases.len());
         add_line!(self, "#define TOKEN_COUNT {}", token_count);
         add_line!(
             self,
@@ -336,19 +362,19 @@ impl Generator {
     }
 
     fn add_symbol_enum(&mut self) {
-        add_line!(self, "enum {{");
+        add_line!(self, "enum ts_symbol_identifiers {{");
         indent!(self);
         self.symbol_order.insert(Symbol::end(), 0);
         let mut i = 1;
-        for symbol in self.parse_table.symbols.iter() {
+        for symbol in &self.parse_table.symbols {
             if *symbol != Symbol::end() {
                 self.symbol_order.insert(*symbol, i);
-                add_line!(self, "{} = {},", self.symbol_ids[&symbol], i);
+                add_line!(self, "{} = {},", self.symbol_ids[symbol], i);
                 i += 1;
             }
         }
         for alias in &self.unique_aliases {
-            add_line!(self, "{} = {},", self.alias_ids[&alias], i);
+            add_line!(self, "{} = {},", self.alias_ids[alias], i);
             i += 1;
         }
         dedent!(self);
@@ -359,20 +385,21 @@ impl Generator {
     fn add_symbol_names_list(&mut self) {
         add_line!(self, "static const char * const ts_symbol_names[] = {{");
         indent!(self);
-        for symbol in self.parse_table.symbols.iter() {
+        for symbol in &self.parse_table.symbols {
             let name = self.sanitize_string(
                 self.default_aliases
                     .get(symbol)
-                    .map(|alias| alias.value.as_str())
-                    .unwrap_or(self.metadata_for_symbol(*symbol).0),
+                    .map_or(self.metadata_for_symbol(*symbol).0, |alias| {
+                        alias.value.as_str()
+                    }),
             );
-            add_line!(self, "[{}] = \"{}\",", self.symbol_ids[&symbol], name);
+            add_line!(self, "[{}] = \"{}\",", self.symbol_ids[symbol], name);
         }
         for alias in &self.unique_aliases {
             add_line!(
                 self,
                 "[{}] = \"{}\",",
-                self.alias_ids[&alias],
+                self.alias_ids[alias],
                 self.sanitize_string(&alias.value)
             );
         }
@@ -397,8 +424,8 @@ impl Generator {
             add_line!(
                 self,
                 "[{}] = {},",
-                self.alias_ids[&alias],
-                self.alias_ids[&alias],
+                self.alias_ids[alias],
+                self.alias_ids[alias],
             );
         }
 
@@ -408,7 +435,7 @@ impl Generator {
     }
 
     fn add_field_name_enum(&mut self) {
-        add_line!(self, "enum {{");
+        add_line!(self, "enum ts_field_identifiers {{");
         indent!(self);
         for (i, field_name) in self.field_names.iter().enumerate() {
             add_line!(self, "{} = {},", self.field_id(field_name), i + 1);
@@ -442,7 +469,7 @@ impl Generator {
         );
         indent!(self);
         for symbol in &self.parse_table.symbols {
-            add_line!(self, "[{}] = {{", self.symbol_ids[&symbol]);
+            add_line!(self, "[{}] = {{", self.symbol_ids[symbol]);
             indent!(self);
             if let Some(Alias { is_named, .. }) = self.default_aliases.get(symbol) {
                 add_line!(self, ".visible = true,");
@@ -474,7 +501,7 @@ impl Generator {
             add_line!(self, "}},");
         }
         for alias in &self.unique_aliases {
-            add_line!(self, "[{}] = {{", self.alias_ids[&alias]);
+            add_line!(self, "[{}] = {{", self.alias_ids[alias]);
             indent!(self);
             add_line!(self, ".visible = true,");
             add_line!(self, ".named = {},", alias.is_named);
@@ -506,7 +533,7 @@ impl Generator {
             indent!(self);
             for (j, alias) in production_info.alias_sequence.iter().enumerate() {
                 if let Some(alias) = alias {
-                    add_line!(self, "[{}] = {},", j, self.alias_ids[&alias]);
+                    add_line!(self, "[{}] = {},", j, self.alias_ids[alias]);
                 }
             }
             dedent!(self);
@@ -525,15 +552,13 @@ impl Generator {
                     if let Some(alias) = &step.alias {
                         if step.symbol.is_non_terminal()
                             && Some(alias) != self.default_aliases.get(&step.symbol)
+                            && self.symbol_ids.contains_key(&step.symbol)
                         {
-                            if self.symbol_ids.contains_key(&step.symbol) {
-                                if let Some(alias_id) = self.alias_ids.get(&alias) {
-                                    let alias_ids = alias_ids_by_symbol
-                                        .entry(step.symbol)
-                                        .or_insert(Vec::new());
-                                    if let Err(i) = alias_ids.binary_search(&alias_id) {
-                                        alias_ids.insert(i, alias_id);
-                                    }
+                            if let Some(alias_id) = self.alias_ids.get(alias) {
+                                let alias_ids =
+                                    alias_ids_by_symbol.entry(step.symbol).or_insert(Vec::new());
+                                if let Err(i) = alias_ids.binary_search(&alias_id) {
+                                    alias_ids.insert(i, alias_id);
                                 }
                             }
                         }
@@ -552,12 +577,12 @@ impl Generator {
         indent!(self);
         for (symbol, alias_ids) in alias_ids_by_symbol {
             let symbol_id = &self.symbol_ids[symbol];
-            let public_symbol_id = &self.symbol_ids[&self.symbol_map[&symbol]];
-            add_line!(self, "{}, {},", symbol_id, 1 + alias_ids.len());
+            let public_symbol_id = &self.symbol_ids[&self.symbol_map[symbol]];
+            add_line!(self, "{symbol_id}, {},", 1 + alias_ids.len());
             indent!(self);
-            add_line!(self, "{},", public_symbol_id);
+            add_line!(self, "{public_symbol_id},");
             for alias_id in alias_ids {
-                add_line!(self, "{},", alias_id);
+                add_line!(self, "{alias_id},");
             }
             dedent!(self);
         }
@@ -583,7 +608,7 @@ impl Generator {
             let primary_state = first_state_for_each_core_id
                 .entry(state.core_id)
                 .or_insert(idx);
-            add_line!(self, "[{}] = {},", idx, primary_state);
+            add_line!(self, "[{idx}] = {primary_state},");
         }
         dedent!(self);
         add_line!(self, "}};");
@@ -594,14 +619,16 @@ impl Generator {
         let mut flat_field_maps = vec![];
         let mut next_flat_field_map_index = 0;
         self.get_field_map_id(
-            &Vec::new(),
+            Vec::new(),
             &mut flat_field_maps,
             &mut next_flat_field_map_index,
         );
 
         let mut field_map_ids = Vec::new();
         for production_info in &self.parse_table.production_infos {
-            if !production_info.field_map.is_empty() {
+            if production_info.field_map.is_empty() {
+                field_map_ids.push((0, 0));
+            } else {
                 let mut flat_field_map = Vec::new();
                 for (field_name, locations) in &production_info.field_map {
                     for location in locations {
@@ -610,14 +637,12 @@ impl Generator {
                 }
                 field_map_ids.push((
                     self.get_field_map_id(
-                        &flat_field_map,
+                        flat_field_map.clone(),
                         &mut flat_field_maps,
                         &mut next_flat_field_map_index,
                     ),
                     flat_field_map.len(),
                 ));
-            } else {
-                field_map_ids.push((0, 0));
             }
         }
 
@@ -630,10 +655,7 @@ impl Generator {
             if length > 0 {
                 add_line!(
                     self,
-                    "[{}] = {{.index = {}, .length = {}}},",
-                    production_id,
-                    row_id,
-                    length
+                    "[{production_id}] = {{.index = {row_id}, .length = {length}}},",
                 );
             }
         }
@@ -647,7 +669,7 @@ impl Generator {
         );
         indent!(self);
         for (row_index, field_pairs) in flat_field_maps.into_iter().skip(1) {
-            add_line!(self, "[{}] =", row_index);
+            add_line!(self, "[{row_index}] =");
             indent!(self);
             for (field_name, location) in field_pairs {
                 add_whitespace!(self);
@@ -665,101 +687,10 @@ impl Generator {
         add_line!(self, "");
     }
 
-    fn add_lex_function(
-        &mut self,
-        name: &str,
-        lex_table: LexTable,
-        extract_helper_functions: bool,
-    ) {
-        let mut ruled_out_chars = HashSet::new();
-        let mut large_character_sets = Vec::<LargeCharacterSetInfo>::new();
-
-        // For each lex state, compute a summary of the code that needs to be
-        // generated.
-        let state_transition_summaries: Vec<Vec<TransitionSummary>> = lex_table
-            .states
-            .iter()
-            .map(|state| {
-                ruled_out_chars.clear();
-
-                // For each state transition, compute the set of character ranges
-                // that need to be checked.
-                state
-                    .advance_actions
-                    .iter()
-                    .map(|(chars, action)| {
-                        let is_included = !chars.contains(std::char::MAX);
-                        let mut ranges;
-                        if is_included {
-                            ranges = chars.simplify_ignoring(&ruled_out_chars);
-                            ruled_out_chars.extend(chars.iter());
-                        } else {
-                            ranges = chars.clone().negate().simplify_ignoring(&ruled_out_chars);
-                            ranges.insert(0, '\0'..'\0')
-                        }
-
-                        // Record any large character sets so that they can be extracted
-                        // into helper functions, reducing code duplication.
-                        let mut call_id = None;
-                        if extract_helper_functions && ranges.len() > LARGE_CHARACTER_RANGE_COUNT {
-                            let char_set_symbol = self
-                                .symbol_for_advance_action(action, &lex_table)
-                                .expect("No symbol for lex state");
-                            let mut count_for_symbol = 0;
-                            for (i, info) in large_character_sets.iter_mut().enumerate() {
-                                if info.ranges == ranges {
-                                    call_id = Some(i);
-                                    break;
-                                }
-                                if info.symbol == char_set_symbol {
-                                    count_for_symbol += 1;
-                                }
-                            }
-                            if call_id.is_none() {
-                                call_id = Some(large_character_sets.len());
-                                large_character_sets.push(LargeCharacterSetInfo {
-                                    symbol: char_set_symbol,
-                                    index: count_for_symbol + 1,
-                                    ranges: ranges.clone(),
-                                });
-                            }
-                        }
-
-                        TransitionSummary {
-                            is_included,
-                            ranges,
-                            call_id,
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
-
-        // Generate a helper function for each large character set.
-        let mut sorted_large_char_sets: Vec<_> = large_character_sets.iter().map(|e| e).collect();
-        sorted_large_char_sets.sort_unstable_by_key(|info| (info.symbol, info.index));
-        for info in sorted_large_char_sets {
-            add_line!(
-                self,
-                "static inline bool {}_character_set_{}(int32_t c) {{",
-                self.symbol_ids[&info.symbol],
-                info.index
-            );
-            indent!(self);
-            add_whitespace!(self);
-            add!(self, "return ");
-            let tree = CharacterTree::from_ranges(&info.ranges);
-            self.add_character_tree(tree.as_ref());
-            add!(self, ";\n");
-            dedent!(self);
-            add_line!(self, "}}");
-            add_line!(self, "");
-        }
-
+    fn add_lex_function(&mut self, name: &str, lex_table: LexTable) {
         add_line!(
             self,
-            "static bool {}(TSLexer *lexer, TSStateId state) {{",
-            name
+            "static bool {name}(TSLexer *lexer, TSStateId state) {{",
         );
         indent!(self);
 
@@ -769,9 +700,9 @@ impl Generator {
 
         indent!(self);
         for (i, state) in lex_table.states.into_iter().enumerate() {
-            add_line!(self, "case {}:", i);
+            add_line!(self, "case {i}:");
             indent!(self);
-            self.add_lex_state(state, &state_transition_summaries[i], &large_character_sets);
+            self.add_lex_state(i, state);
             dedent!(self);
         }
 
@@ -788,35 +719,7 @@ impl Generator {
         add_line!(self, "");
     }
 
-    fn symbol_for_advance_action(
-        &self,
-        action: &AdvanceAction,
-        lex_table: &LexTable,
-    ) -> Option<Symbol> {
-        let mut state_ids = vec![action.state];
-        let mut i = 0;
-        while i < state_ids.len() {
-            let id = state_ids[i];
-            let state = &lex_table.states[id];
-            if let Some(accept) = state.accept_action {
-                return Some(accept);
-            }
-            for (_, action) in &state.advance_actions {
-                if !state_ids.contains(&action.state) {
-                    state_ids.push(action.state);
-                }
-            }
-            i += 1;
-        }
-        return None;
-    }
-
-    fn add_lex_state(
-        &mut self,
-        state: LexState,
-        transition_info: &Vec<TransitionSummary>,
-        large_character_sets: &Vec<LargeCharacterSetInfo>,
-    ) {
+    fn add_lex_state(&mut self, _state_ix: usize, state: LexState) {
         if let Some(accept_action) = state.accept_action {
             add_line!(self, "ACCEPT_TOKEN({});", self.symbol_ids[&accept_action]);
         }
@@ -825,37 +728,176 @@ impl Generator {
             add_line!(self, "if (eof) ADVANCE({});", eof_action.state);
         }
 
-        for (i, (_, action)) in state.advance_actions.into_iter().enumerate() {
-            let transition = &transition_info[i];
+        let mut chars_copy = CharacterSet::empty();
+        let mut large_set = CharacterSet::empty();
+        let mut ruled_out_chars = CharacterSet::empty();
+
+        // The transitions in a lex state are sorted with the single-character
+        // transitions first. If there are many single-character transitions,
+        // then implement them using an array of (lookahead character, state)
+        // pairs, instead of individual if statements, in order to reduce compile
+        // time.
+        let mut leading_simple_transition_count = 0;
+        let mut leading_simple_transition_range_count = 0;
+        for (chars, action) in &state.advance_actions {
+            if action.in_main_token
+                && chars.ranges().all(|r| {
+                    let start = *r.start() as u32;
+                    let end = *r.end() as u32;
+                    end <= start + 1 && end <= u16::MAX as u32
+                })
+            {
+                leading_simple_transition_count += 1;
+                leading_simple_transition_range_count += chars.range_count();
+            } else {
+                break;
+            }
+        }
+
+        if leading_simple_transition_range_count >= 8 {
+            add_line!(self, "ADVANCE_MAP(");
+            indent!(self);
+            for (chars, action) in &state.advance_actions[0..leading_simple_transition_count] {
+                for range in chars.ranges() {
+                    add_whitespace!(self);
+                    self.add_character(*range.start());
+                    add!(self, ", {},\n", action.state);
+                    if range.end() > range.start() {
+                        add_whitespace!(self);
+                        self.add_character(*range.end());
+                        add!(self, ", {},\n", action.state);
+                    }
+                }
+                ruled_out_chars = ruled_out_chars.add(chars);
+            }
+            dedent!(self);
+            add_line!(self, ");");
+        } else {
+            leading_simple_transition_count = 0;
+        }
+
+        for (chars, action) in &state.advance_actions[leading_simple_transition_count..] {
             add_whitespace!(self);
 
-            // If there is a helper function for this transition's character
-            // set, then generate a call to that helper function.
-            if let Some(call_id) = transition.call_id {
-                let info = &large_character_sets[call_id];
-                add!(self, "if (");
-                if !transition.is_included {
-                    add!(self, "!");
+            // The lex state's advance actions are represented with disjoint
+            // sets of characters. When translating these disjoint sets into a
+            // sequence of checks, we don't need to re-check conditions that
+            // have already been checked due to previous transitions.
+            //
+            // Note that this simplification may result in an empty character set.
+            // That means that the transition is guaranteed (nothing further needs to
+            // be checked), not that this transition is impossible.
+            let simplified_chars = chars.simplify_ignoring(&ruled_out_chars);
+
+            // For large character sets, find the best matching character set from
+            // a pre-selected list of large character sets, which are based on the
+            // state transitions for invidual tokens. This transition may not exactly
+            // match one of the pre-selected character sets. In that case, determine
+            // the additional checks that need to be performed to match this transition.
+            let mut best_large_char_set: Option<(usize, CharacterSet, CharacterSet)> = None;
+            if simplified_chars.range_count() >= super::build_tables::LARGE_CHARACTER_RANGE_COUNT {
+                for (ix, (_, set)) in self.large_character_sets.iter().enumerate() {
+                    chars_copy.assign(&simplified_chars);
+                    large_set.assign(set);
+                    let intersection = chars_copy.remove_intersection(&mut large_set);
+                    if !intersection.is_empty() {
+                        let additions = chars_copy.simplify_ignoring(&ruled_out_chars);
+                        let removals = large_set.simplify_ignoring(&ruled_out_chars);
+                        let total_range_count = additions.range_count() + removals.range_count();
+                        if total_range_count >= simplified_chars.range_count() {
+                            continue;
+                        }
+                        if let Some((_, best_additions, best_removals)) = &best_large_char_set {
+                            let best_range_count =
+                                best_additions.range_count() + best_removals.range_count();
+                            if best_range_count < total_range_count {
+                                continue;
+                            }
+                        }
+                        best_large_char_set = Some((ix, additions, removals));
+                    }
                 }
-                add!(
-                    self,
-                    "{}_character_set_{}(lookahead)) ",
-                    self.symbol_ids[&info.symbol],
-                    info.index
-                );
-                self.add_advance_action(&action);
-                add!(self, "\n");
-                continue;
             }
 
-            // Otherwise, generate code to compare the lookahead character
-            // with all of the character ranges.
-            if transition.ranges.len() > 0 {
+            // Add this transition's character set to the set of ruled out characters,
+            // which don't need to be checked for subsequent transitions in this state.
+            ruled_out_chars = ruled_out_chars.add(chars);
+
+            let mut large_char_set_ix = None;
+            let mut asserted_chars = simplified_chars;
+            let mut negated_chars = CharacterSet::empty();
+            if let Some((char_set_ix, additions, removals)) = best_large_char_set {
+                asserted_chars = additions;
+                negated_chars = removals;
+                large_char_set_ix = Some(char_set_ix);
+            }
+
+            let mut line_break = "\n".to_string();
+            for _ in 0..self.indent_level + 2 {
+                line_break.push_str("  ");
+            }
+
+            let has_positive_condition = large_char_set_ix.is_some() || !asserted_chars.is_empty();
+            let has_negative_condition = !negated_chars.is_empty();
+            let has_condition = has_positive_condition || has_negative_condition;
+            if has_condition {
                 add!(self, "if (");
-                self.add_character_range_conditions(&transition.ranges, transition.is_included, 2);
+                if has_positive_condition && has_negative_condition {
+                    add!(self, "(");
+                }
+            }
+
+            if let Some(large_char_set_ix) = large_char_set_ix {
+                let large_set = &self.large_character_sets[large_char_set_ix].1;
+
+                // If the character set contains the null character, check that we
+                // are not at the end of the file.
+                let check_eof = large_set.contains('\0');
+                if check_eof {
+                    add!(self, "(!eof && ")
+                }
+
+                let char_set_info = &mut self.large_character_set_info[large_char_set_ix];
+                char_set_info.is_used = true;
+                add!(
+                    self,
+                    "set_contains({}, {}, lookahead)",
+                    &char_set_info.constant_name,
+                    large_set.range_count(),
+                );
+                if check_eof {
+                    add!(self, ")");
+                }
+            }
+
+            if !asserted_chars.is_empty() {
+                if large_char_set_ix.is_some() {
+                    add!(self, " ||{line_break}");
+                }
+
+                // If the character set contains the max character, than it probably
+                // corresponds to a negated character class in a regex, so it will be more
+                // concise and readable to express it in terms of negated ranges.
+                let is_included = !asserted_chars.contains(char::MAX);
+                if !is_included {
+                    asserted_chars = asserted_chars.negate().add_char('\0');
+                }
+
+                self.add_character_range_conditions(&asserted_chars, is_included, &line_break);
+            }
+
+            if has_negative_condition {
+                if has_positive_condition {
+                    add!(self, ") &&{line_break}");
+                }
+                self.add_character_range_conditions(&negated_chars, false, &line_break);
+            }
+
+            if has_condition {
                 add!(self, ") ");
             }
-            self.add_advance_action(&action);
+
+            self.add_advance_action(action);
             add!(self, "\n");
         }
 
@@ -864,128 +906,110 @@ impl Generator {
 
     fn add_character_range_conditions(
         &mut self,
-        ranges: &[Range<char>],
+        characters: &CharacterSet,
         is_included: bool,
-        indent_count: usize,
+        line_break: &str,
     ) {
-        let mut line_break = "\n".to_string();
-        for _ in 0..self.indent_level + indent_count {
-            line_break.push_str("  ");
-        }
-
-        for (i, range) in ranges.iter().enumerate() {
+        for (i, range) in characters.ranges().enumerate() {
+            let start = *range.start();
+            let end = *range.end();
             if is_included {
                 if i > 0 {
-                    add!(self, " ||{}", line_break);
+                    add!(self, " ||{line_break}");
                 }
-                if range.end == range.start {
+
+                if start == '\0' {
+                    add!(self, "(!eof && ");
+                    if end == '\0' {
+                        add!(self, "lookahead == 0");
+                    } else {
+                        add!(self, "lookahead <= ");
+                    }
+                    self.add_character(end);
+                    add!(self, ")");
+                    continue;
+                } else if end == start {
                     add!(self, "lookahead == ");
-                    self.add_character(range.start);
-                } else if range.end as u32 == range.start as u32 + 1 {
+                    self.add_character(start);
+                } else if end as u32 == start as u32 + 1 {
                     add!(self, "lookahead == ");
-                    self.add_character(range.start);
-                    add!(self, " ||{}lookahead == ", line_break);
-                    self.add_character(range.end);
+                    self.add_character(start);
+                    add!(self, " ||{line_break}lookahead == ");
+                    self.add_character(end);
                 } else {
                     add!(self, "(");
-                    self.add_character(range.start);
+                    self.add_character(start);
                     add!(self, " <= lookahead && lookahead <= ");
-                    self.add_character(range.end);
+                    self.add_character(end);
                     add!(self, ")");
                 }
             } else {
                 if i > 0 {
-                    add!(self, " &&{}", line_break);
+                    add!(self, " &&{line_break}");
                 }
-                if range.end == range.start {
+                if end == start {
                     add!(self, "lookahead != ");
-                    self.add_character(range.start);
-                } else if range.end as u32 == range.start as u32 + 1 {
+                    self.add_character(start);
+                } else if end as u32 == start as u32 + 1 {
                     add!(self, "lookahead != ");
-                    self.add_character(range.start);
-                    add!(self, " &&{}lookahead != ", line_break);
-                    self.add_character(range.end);
+                    self.add_character(start);
+                    add!(self, " &&{line_break}lookahead != ");
+                    self.add_character(end);
+                } else if start != '\0' {
+                    add!(self, "(lookahead < ");
+                    self.add_character(start);
+                    add!(self, " || ");
+                    self.add_character(end);
+                    add!(self, " < lookahead)");
                 } else {
-                    if range.start != '\0' {
-                        add!(self, "(lookahead < ");
-                        self.add_character(range.start);
-                        add!(self, " || ");
-                        self.add_character(range.end);
-                        add!(self, " < lookahead)");
-                    } else {
-                        add!(self, "lookahead > ");
-                        self.add_character(range.end);
-                    }
+                    add!(self, "lookahead > ");
+                    self.add_character(end);
                 }
             }
         }
     }
 
-    fn add_character_tree(&mut self, tree: Option<&CharacterTree>) {
-        match tree {
-            Some(CharacterTree::Compare {
-                value,
-                operator,
-                consequence,
-                alternative,
-            }) => {
-                let op = match operator {
-                    Comparator::Less => "<",
-                    Comparator::LessOrEqual => "<=",
-                    Comparator::Equal => "==",
-                    Comparator::GreaterOrEqual => ">=",
-                };
-                let consequence = consequence.as_ref().map(Box::as_ref);
-                let alternative = alternative.as_ref().map(Box::as_ref);
-
-                let simple = alternative.is_none() && consequence == Some(&CharacterTree::Yes);
-
-                if !simple {
-                    add!(self, "(");
-                }
-
-                add!(self, "c {} ", op);
-                self.add_character(*value);
-
-                if !simple {
-                    if alternative.is_none() {
-                        add!(self, " && ");
-                        self.add_character_tree(consequence);
-                    } else if consequence == Some(&CharacterTree::Yes) {
-                        add!(self, " || ");
-                        self.add_character_tree(alternative);
-                    } else {
-                        add!(self, "\n");
-                        indent!(self);
-                        add_whitespace!(self);
-                        add!(self, "? ");
-                        self.add_character_tree(consequence);
-                        add!(self, "\n");
-                        add_whitespace!(self);
-                        add!(self, ": ");
-                        self.add_character_tree(alternative);
-                        dedent!(self);
-                    }
-                }
-
-                if !simple {
-                    add!(self, ")");
-                }
-            }
-            Some(CharacterTree::Yes) => {
-                add!(self, "true");
-            }
-            None => {
-                add!(self, "false");
-            }
+    fn add_character_set(&mut self, ix: usize) {
+        let characters = self.large_character_sets[ix].1.clone();
+        let info = &self.large_character_set_info[ix];
+        if !info.is_used {
+            return;
         }
+
+        add_line!(
+            self,
+            "static TSCharacterRange {}[] = {{",
+            info.constant_name
+        );
+
+        indent!(self);
+        for (ix, range) in characters.ranges().enumerate() {
+            let column = ix % 8;
+            if column == 0 {
+                if ix > 0 {
+                    add!(self, "\n");
+                }
+                add_whitespace!(self);
+            } else {
+                add!(self, " ");
+            }
+            add!(self, "{{");
+            self.add_character(*range.start());
+            add!(self, ", ");
+            self.add_character(*range.end());
+            add!(self, "}},");
+        }
+        add!(self, "\n");
+        dedent!(self);
+        add_line!(self, "}};");
+        add_line!(self, "");
     }
 
     fn add_advance_action(&mut self, action: &AdvanceAction) {
         if action.in_main_token {
             add!(self, "ADVANCE({});", action.state);
         } else {
-            add!(self, "SKIP({})", action.state);
+            add!(self, "SKIP({});", action.state);
         }
     }
 
@@ -997,17 +1021,16 @@ impl Generator {
         indent!(self);
         for (i, state) in self.parse_table.states.iter().enumerate() {
             if state.is_end_of_non_terminal_extra() {
-                add_line!(self, "[{}] = {{(TSStateId)(-1)}},", i,);
+                add_line!(self, "[{i}] = {{(TSStateId)(-1)}},");
             } else if state.external_lex_state_id > 0 {
                 add_line!(
                     self,
-                    "[{}] = {{.lex_state = {}, .external_lex_state = {}}},",
-                    i,
+                    "[{i}] = {{.lex_state = {}, .external_lex_state = {}}},",
                     state.lex_state_id,
                     state.external_lex_state_id
                 );
             } else {
-                add_line!(self, "[{}] = {{.lex_state = {}}},", i, state.lex_state_id);
+                add_line!(self, "[{i}] = {{.lex_state = {}}},", state.lex_state_id);
             }
         }
         dedent!(self);
@@ -1016,7 +1039,7 @@ impl Generator {
     }
 
     fn add_external_token_enum(&mut self) {
-        add_line!(self, "enum {{");
+        add_line!(self, "enum ts_external_scanner_symbol_identifiers {{");
         indent!(self);
         for i in 0..self.syntax_grammar.external_tokens.len() {
             add_line!(
@@ -1041,11 +1064,11 @@ impl Generator {
             let token = &self.syntax_grammar.external_tokens[i];
             let id_token = token
                 .corresponding_internal_token
-                .unwrap_or(Symbol::external(i));
+                .unwrap_or_else(|| Symbol::external(i));
             add_line!(
                 self,
                 "[{}] = {},",
-                self.external_token_id(&token),
+                self.external_token_id(token),
                 self.symbol_ids[&id_token],
             );
         }
@@ -1140,12 +1163,7 @@ impl Generator {
                     &mut parse_table_entries,
                     &mut next_parse_action_list_index,
                 );
-                add_line!(
-                    self,
-                    "[{}] = ACTIONS({}),",
-                    self.symbol_ids[symbol],
-                    entry_id
-                );
+                add_line!(self, "[{}] = ACTIONS({entry_id}),", self.symbol_ids[symbol]);
             }
             dedent!(self);
             add_line!(self, "}},");
@@ -1160,7 +1178,7 @@ impl Generator {
 
             let mut index = 0;
             let mut small_state_indices = Vec::new();
-            let mut symbols_by_value: HashMap<(usize, SymbolType), Vec<Symbol>> = HashMap::new();
+            let mut symbols_by_value = HashMap::<(usize, SymbolType), Vec<Symbol>>::new();
             for state in self.parse_table.states.iter().skip(self.large_state_count) {
                 small_state_indices.push(index);
                 symbols_by_value.clear();
@@ -1201,14 +1219,14 @@ impl Generator {
                     (symbols.len(), *kind, *value, symbols[0])
                 });
 
-                add_line!(self, "[{}] = {},", index, values_with_symbols.len());
+                add_line!(self, "[{index}] = {},", values_with_symbols.len());
                 indent!(self);
 
-                for ((value, kind), symbols) in values_with_symbols.iter_mut() {
+                for ((value, kind), symbols) in &mut values_with_symbols {
                     if *kind == SymbolType::NonTerminal {
-                        add_line!(self, "STATE({}), {},", value, symbols.len());
+                        add_line!(self, "STATE({value}), {},", symbols.len());
                     } else {
-                        add_line!(self, "ACTIONS({}), {},", value, symbols.len());
+                        add_line!(self, "ACTIONS({value}), {},", symbols.len());
                     }
 
                     symbols.sort_unstable();
@@ -1239,8 +1257,7 @@ impl Generator {
             for i in self.large_state_count..self.parse_table.states.len() {
                 add_line!(
                     self,
-                    "[SMALL_STATE({})] = {},",
-                    i,
+                    "[SMALL_STATE({i})] = {},",
                     small_state_indices[i - self.large_state_count]
                 );
             }
@@ -1249,10 +1266,10 @@ impl Generator {
             add_line!(self, "");
         }
 
-        let mut parse_table_entries: Vec<_> = parse_table_entries
+        let mut parse_table_entries = parse_table_entries
             .into_iter()
             .map(|(entry, i)| (i, entry))
-            .collect();
+            .collect::<Vec<_>>();
         parse_table_entries.sort_by_key(|(index, _)| *index);
         self.add_parse_action_list(parse_table_entries);
     }
@@ -1266,8 +1283,7 @@ impl Generator {
         for (i, entry) in parse_table_entries {
             add!(
                 self,
-                "  [{}] = {{.entry = {{.count = {}, .reusable = {}}}}},",
-                i,
+                "  [{i}] = {{.entry = {{.count = {}, .reusable = {}}}}},",
                 entry.actions.len(),
                 entry.reusable
             );
@@ -1282,9 +1298,9 @@ impl Generator {
                         is_repetition,
                     } => {
                         if is_repetition {
-                            add!(self, "SHIFT_REPEAT({})", state);
+                            add!(self, "SHIFT_REPEAT({state})");
                         } else {
-                            add!(self, "SHIFT({})", state);
+                            add!(self, "SHIFT({state})");
                         }
                     }
                     ParseAction::Reduce {
@@ -1294,17 +1310,14 @@ impl Generator {
                         production_id,
                         ..
                     } => {
-                        add!(self, "REDUCE({}, {}", self.symbol_ids[&symbol], child_count);
-                        if dynamic_precedence != 0 {
-                            add!(self, ", .dynamic_precedence = {}", dynamic_precedence);
-                        }
-                        if production_id != 0 {
-                            add!(self, ", .production_id = {}", production_id);
-                        }
-                        add!(self, ")");
+                        add!(
+                            self,
+                            "REDUCE({}, {child_count}, {dynamic_precedence}, {production_id})",
+                            self.symbol_ids[&symbol]
+                        );
                     }
                 }
-                add!(self, ",")
+                add!(self, ",");
             }
             add!(self, "\n");
         }
@@ -1315,42 +1328,45 @@ impl Generator {
 
     fn add_parser_export(&mut self) {
         let language_function_name = format!("tree_sitter_{}", self.language_name);
-        let external_scanner_name = format!("{}_external_scanner", language_function_name);
+        let external_scanner_name = format!("{language_function_name}_external_scanner");
 
         add_line!(self, "#ifdef __cplusplus");
         add_line!(self, r#"extern "C" {{"#);
         add_line!(self, "#endif");
 
         if !self.syntax_grammar.external_tokens.is_empty() {
-            add_line!(self, "void *{}_create(void);", external_scanner_name);
-            add_line!(self, "void {}_destroy(void *);", external_scanner_name);
+            add_line!(self, "void *{external_scanner_name}_create(void);");
+            add_line!(self, "void {external_scanner_name}_destroy(void *);");
             add_line!(
                 self,
-                "bool {}_scan(void *, TSLexer *, const bool *);",
-                external_scanner_name
+                "bool {external_scanner_name}_scan(void *, TSLexer *, const bool *);",
             );
             add_line!(
                 self,
-                "unsigned {}_serialize(void *, char *);",
-                external_scanner_name
+                "unsigned {external_scanner_name}_serialize(void *, char *);",
             );
             add_line!(
                 self,
-                "void {}_deserialize(void *, const char *, unsigned);",
-                external_scanner_name
+                "void {external_scanner_name}_deserialize(void *, const char *, unsigned);",
             );
             add_line!(self, "");
         }
 
-        add_line!(self, "#ifdef _WIN32");
-        add_line!(self, "#define extern __declspec(dllexport)");
+        add_line!(self, "#ifdef TREE_SITTER_HIDE_SYMBOLS");
+        add_line!(self, "#define TS_PUBLIC");
+        add_line!(self, "#elif defined(_WIN32)");
+        add_line!(self, "#define TS_PUBLIC __declspec(dllexport)");
+        add_line!(self, "#else");
+        add_line!(
+            self,
+            "#define TS_PUBLIC __attribute__((visibility(\"default\")))"
+        );
         add_line!(self, "#endif");
         add_line!(self, "");
 
         add_line!(
             self,
-            "extern const TSLanguage *{}(void) {{",
-            language_function_name
+            "TS_PUBLIC const TSLanguage *{language_function_name}(void) {{",
         );
         indent!(self);
         add_line!(self, "static const TSLanguage language = {{");
@@ -1410,11 +1426,11 @@ impl Generator {
             indent!(self);
             add_line!(self, "&ts_external_scanner_states[0][0],");
             add_line!(self, "ts_external_scanner_symbol_map,");
-            add_line!(self, "{}_create,", external_scanner_name);
-            add_line!(self, "{}_destroy,", external_scanner_name);
-            add_line!(self, "{}_scan,", external_scanner_name);
-            add_line!(self, "{}_serialize,", external_scanner_name);
-            add_line!(self, "{}_deserialize,", external_scanner_name);
+            add_line!(self, "{external_scanner_name}_create,");
+            add_line!(self, "{external_scanner_name}_destroy,");
+            add_line!(self, "{external_scanner_name}_scan,");
+            add_line!(self, "{external_scanner_name}_serialize,");
+            add_line!(self, "{external_scanner_name}_deserialize,");
             dedent!(self);
             add_line!(self, "}},");
         }
@@ -1451,7 +1467,7 @@ impl Generator {
 
     fn get_field_map_id(
         &self,
-        flat_field_map: &Vec<(String, FieldLocation)>,
+        flat_field_map: Vec<(String, FieldLocation)>,
         flat_field_maps: &mut Vec<(usize, Vec<(String, FieldLocation)>)>,
         next_flat_field_map_index: &mut usize,
     ) -> usize {
@@ -1460,8 +1476,8 @@ impl Generator {
         }
 
         let result = *next_flat_field_map_index;
-        flat_field_maps.push((result, flat_field_map.clone()));
         *next_flat_field_map_index += flat_field_map.len();
+        flat_field_maps.push((result, flat_field_map));
         result
     }
 
@@ -1500,8 +1516,8 @@ impl Generator {
         self.symbol_ids.insert(symbol, id);
     }
 
-    fn field_id(&self, field_name: &String) -> String {
-        format!("field_{}", field_name)
+    fn field_id(&self, field_name: &str) -> String {
+        format!("field_{field_name}")
     }
 
     fn metadata_for_symbol(&self, symbol: Symbol) -> (&str, VariableType) {
@@ -1525,54 +1541,93 @@ impl Generator {
     fn sanitize_identifier(&self, name: &str) -> String {
         let mut result = String::with_capacity(name.len());
         for c in name.chars() {
-            if ('a' <= c && c <= 'z')
-                || ('A' <= c && c <= 'Z')
-                || ('0' <= c && c <= '9')
-                || c == '_'
-            {
+            if c.is_ascii_alphanumeric() || c == '_' {
                 result.push(c);
             } else {
-                let replacement = match c {
-                    '~' => "TILDE",
-                    '`' => "BQUOTE",
-                    '!' => "BANG",
-                    '@' => "AT",
-                    '#' => "POUND",
-                    '$' => "DOLLAR",
-                    '%' => "PERCENT",
-                    '^' => "CARET",
-                    '&' => "AMP",
-                    '*' => "STAR",
-                    '(' => "LPAREN",
-                    ')' => "RPAREN",
-                    '-' => "DASH",
-                    '+' => "PLUS",
-                    '=' => "EQ",
-                    '{' => "LBRACE",
-                    '}' => "RBRACE",
-                    '[' => "LBRACK",
-                    ']' => "RBRACK",
-                    '\\' => "BSLASH",
-                    '|' => "PIPE",
-                    ':' => "COLON",
-                    ';' => "SEMI",
-                    '"' => "DQUOTE",
-                    '\'' => "SQUOTE",
-                    '<' => "LT",
-                    '>' => "GT",
-                    ',' => "COMMA",
-                    '.' => "DOT",
-                    '?' => "QMARK",
-                    '/' => "SLASH",
-                    '\n' => "LF",
-                    '\r' => "CR",
-                    '\t' => "TAB",
-                    _ => continue,
-                };
-                if !result.is_empty() && !result.ends_with("_") {
-                    result.push('_');
+                'special_chars: {
+                    let replacement = match c {
+                        ' ' if name.len() == 1 => "SPACE",
+                        '~' => "TILDE",
+                        '`' => "BQUOTE",
+                        '!' => "BANG",
+                        '@' => "AT",
+                        '#' => "POUND",
+                        '$' => "DOLLAR",
+                        '%' => "PERCENT",
+                        '^' => "CARET",
+                        '&' => "AMP",
+                        '*' => "STAR",
+                        '(' => "LPAREN",
+                        ')' => "RPAREN",
+                        '-' => "DASH",
+                        '+' => "PLUS",
+                        '=' => "EQ",
+                        '{' => "LBRACE",
+                        '}' => "RBRACE",
+                        '[' => "LBRACK",
+                        ']' => "RBRACK",
+                        '\\' => "BSLASH",
+                        '|' => "PIPE",
+                        ':' => "COLON",
+                        ';' => "SEMI",
+                        '"' => "DQUOTE",
+                        '\'' => "SQUOTE",
+                        '<' => "LT",
+                        '>' => "GT",
+                        ',' => "COMMA",
+                        '.' => "DOT",
+                        '?' => "QMARK",
+                        '/' => "SLASH",
+                        '\n' => "LF",
+                        '\r' => "CR",
+                        '\t' => "TAB",
+                        '\0' => "NULL",
+                        '\u{0001}' => "SOH",
+                        '\u{0002}' => "STX",
+                        '\u{0003}' => "ETX",
+                        '\u{0004}' => "EOT",
+                        '\u{0005}' => "ENQ",
+                        '\u{0006}' => "ACK",
+                        '\u{0007}' => "BEL",
+                        '\u{0008}' => "BS",
+                        '\u{000b}' => "VTAB",
+                        '\u{000c}' => "FF",
+                        '\u{000e}' => "SO",
+                        '\u{000f}' => "SI",
+                        '\u{0010}' => "DLE",
+                        '\u{0011}' => "DC1",
+                        '\u{0012}' => "DC2",
+                        '\u{0013}' => "DC3",
+                        '\u{0014}' => "DC4",
+                        '\u{0015}' => "NAK",
+                        '\u{0016}' => "SYN",
+                        '\u{0017}' => "ETB",
+                        '\u{0018}' => "CAN",
+                        '\u{0019}' => "EM",
+                        '\u{001a}' => "SUB",
+                        '\u{001b}' => "ESC",
+                        '\u{001c}' => "FS",
+                        '\u{001d}' => "GS",
+                        '\u{001e}' => "RS",
+                        '\u{001f}' => "US",
+                        '\u{007F}' => "DEL",
+                        '\u{FEFF}' => "BOM",
+                        '\u{0080}'..='\u{FFFF}' => {
+                            result.push_str(&format!("u{:04x}", c as u32));
+                            break 'special_chars;
+                        }
+                        '\u{10000}'..='\u{10FFFF}' => {
+                            result.push_str(&format!("U{:08x}", c as u32));
+                            break 'special_chars;
+                        }
+                        '0'..='9' | 'a'..='z' | 'A'..='Z' | '_' => unreachable!(),
+                        ' ' => break 'special_chars,
+                    };
+                    if !result.is_empty() && !result.ends_with('_') {
+                        result.push('_');
+                    }
+                    result += replacement;
                 }
-                result += replacement;
             }
         }
         result
@@ -1585,10 +1640,19 @@ impl Generator {
                 '\"' => result += "\\\"",
                 '?' => result += "\\?",
                 '\\' => result += "\\\\",
+                '\u{0007}' => result += "\\a",
+                '\u{0008}' => result += "\\b",
+                '\u{000b}' => result += "\\v",
                 '\u{000c}' => result += "\\f",
                 '\n' => result += "\\n",
                 '\r' => result += "\\r",
                 '\t' => result += "\\t",
+                '\0' => result += "\\0",
+                '\u{0001}'..='\u{001f}' => result += &format!("\\x{:02x}", c as u32),
+                '\u{007F}'..='\u{FFFF}' => result += &format!("\\u{:04x}", c as u32),
+                '\u{10000}'..='\u{10FFFF}' => {
+                    result.push_str(&format!("\\U{:08x}", c as u32));
+                }
                 _ => result.push(c),
             }
         }
@@ -1604,10 +1668,12 @@ impl Generator {
             '\t' => add!(self, "'\\t'"),
             '\r' => add!(self, "'\\r'"),
             _ => {
-                if c == ' ' || c.is_ascii_graphic() {
-                    add!(self, "'{}'", c)
+                if c == '\0' {
+                    add!(self, "0")
+                } else if c == ' ' || c.is_ascii_graphic() {
+                    add!(self, "'{c}'");
                 } else {
-                    add!(self, "{}", c as u32)
+                    add!(self, "0x{:02x}", c as u32);
                 }
             }
         }
@@ -1622,43 +1688,40 @@ impl Generator {
 /// * `parse_table` - The generated parse table for the language
 /// * `main_lex_table` - The generated lexing table for the language
 /// * `keyword_lex_table` - The generated keyword lexing table for the language
-/// * `keyword_capture_token` - A symbol indicating which token is used
-///    for keyword capture, if any.
+/// * `keyword_capture_token` - A symbol indicating which token is used for keyword capture, if any.
 /// * `syntax_grammar` - The syntax grammar extracted from the language's grammar
 /// * `lexical_grammar` - The lexical grammar extracted from the language's grammar
-/// * `default_aliases` - A map describing the global rename rules that should apply.
-///    the keys are symbols that are *always* aliased in the same way, and the values
-///    are the aliases that are applied to those symbols.
-/// * `abi_version` - The language ABI version that should be generated. Usually
-///    you want Tree-sitter's current version, but right after making an ABI
-///    change, it may be useful to generate code with the previous ABI.
-pub(crate) fn render_c_code(
+/// * `default_aliases` - A map describing the global rename rules that should apply. the keys are
+///   symbols that are *always* aliased in the same way, and the values are the aliases that are
+///   applied to those symbols.
+/// * `abi_version` - The language ABI version that should be generated. Usually you want
+///   Tree-sitter's current version, but right after making an ABI change, it may be useful to
+///   generate code with the previous ABI.
+#[allow(clippy::too_many_arguments)]
+pub fn render_c_code(
     name: &str,
-    parse_table: ParseTable,
-    main_lex_table: LexTable,
-    keyword_lex_table: LexTable,
-    keyword_capture_token: Option<Symbol>,
+    tables: Tables,
     syntax_grammar: SyntaxGrammar,
     lexical_grammar: LexicalGrammar,
     default_aliases: AliasMap,
     abi_version: usize,
 ) -> String {
-    if !(ABI_VERSION_MIN..=ABI_VERSION_MAX).contains(&abi_version) {
-        panic!(
-            "This version of Tree-sitter can only generate parsers with ABI version {} - {}, not {}",
-            ABI_VERSION_MIN, ABI_VERSION_MAX, abi_version
-        );
-    }
+    assert!(
+        (ABI_VERSION_MIN..=ABI_VERSION_MAX).contains(&abi_version),
+        "This version of Tree-sitter can only generate parsers with ABI version {ABI_VERSION_MIN} - {ABI_VERSION_MAX}, not {abi_version}",
+    );
 
     Generator {
         buffer: String::new(),
         indent_level: 0,
         language_name: name.to_string(),
         large_state_count: 0,
-        parse_table,
-        main_lex_table,
-        keyword_lex_table,
-        keyword_capture_token,
+        parse_table: tables.parse_table,
+        main_lex_table: tables.main_lex_table,
+        keyword_lex_table: tables.keyword_lex_table,
+        keyword_capture_token: tables.word_token,
+        large_character_sets: tables.large_character_sets,
+        large_character_set_info: Vec::new(),
         syntax_grammar,
         lexical_grammar,
         default_aliases,

@@ -23,7 +23,7 @@ function alias(rule, value) {
       }
   }
 
-  throw new Error('Invalid alias value ' + value);
+  throw new Error(`Invalid alias value ${value}`);
 }
 
 function blank() {
@@ -35,7 +35,7 @@ function blank() {
 function field(name, rule) {
   return {
     type: "FIELD",
-    name: name,
+    name,
     content: normalize(rule)
   }
 }
@@ -48,13 +48,14 @@ function choice(...elements) {
 }
 
 function optional(value) {
-  checkArguments(arguments.length, optional, 'optional');
+  checkArguments(arguments, arguments.length, optional, 'optional');
   return choice(value, blank());
 }
 
 function prec(number, rule) {
   checkPrecedence(number);
   checkArguments(
+    arguments,
     arguments.length - 1,
     prec,
     'prec',
@@ -76,6 +77,7 @@ prec.left = function(number, rule) {
 
   checkPrecedence(number);
   checkArguments(
+    arguments,
     arguments.length - 1,
     prec.left,
     'prec.left',
@@ -97,6 +99,7 @@ prec.right = function(number, rule) {
 
   checkPrecedence(number);
   checkArguments(
+    arguments,
     arguments.length - 1,
     prec.right,
     'prec.right',
@@ -113,6 +116,7 @@ prec.right = function(number, rule) {
 prec.dynamic = function(number, rule) {
   checkPrecedence(number);
   checkArguments(
+    arguments,
     arguments.length - 1,
     prec.dynamic,
     'prec.dynamic',
@@ -127,7 +131,7 @@ prec.dynamic = function(number, rule) {
 }
 
 function repeat(rule) {
-  checkArguments(arguments.length, repeat, 'repeat');
+  checkArguments(arguments, arguments.length, repeat, 'repeat');
   return {
     type: "REPEAT",
     content: normalize(rule)
@@ -135,7 +139,7 @@ function repeat(rule) {
 }
 
 function repeat1(rule) {
-  checkArguments(arguments.length, repeat1, 'repeat1');
+  checkArguments(arguments, arguments.length, repeat1, 'repeat1');
   return {
     type: "REPEAT1",
     content: normalize(rule)
@@ -152,11 +156,12 @@ function seq(...elements) {
 function sym(name) {
   return {
     type: "SYMBOL",
-    name: name
+    name
   };
 }
 
 function token(value) {
+  checkArguments(arguments, arguments.length, token, 'token', '', 'literal');
   return {
     type: "TOKEN",
     content: normalize(value)
@@ -164,6 +169,7 @@ function token(value) {
 }
 
 token.immediate = function(value) {
+  checkArguments(arguments, arguments.length, token.immediate, 'token.immediate', '', 'literal');
   return {
     type: "IMMEDIATE_TOKEN",
     content: normalize(value)
@@ -181,7 +187,11 @@ function normalize(value) {
         value
       };
     case RegExp:
-      return {
+      return value.flags ? {
+        type: 'PATTERN',
+        value: value.source,
+        flags: value.flags
+      } : {
         type: 'PATTERN',
         value: value.source
       };
@@ -191,17 +201,17 @@ function normalize(value) {
       if (typeof value.type === 'string') {
         return value;
       } else {
-        throw new TypeError("Invalid rule: " + value.toString());
+        throw new TypeError(`Invalid rule: ${value}`);
       }
   }
 }
 
 function RuleBuilder(ruleMap) {
   return new Proxy({}, {
-    get(target, propertyName) {
+    get(_, propertyName) {
       const symbol = sym(propertyName);
 
-      if (!ruleMap || ruleMap.hasOwnProperty(propertyName)) {
+      if (!ruleMap || Object.prototype.hasOwnProperty.call(ruleMap, propertyName)) {
         return symbol;
       } else {
         const error = new ReferenceError(`Undefined symbol '${propertyName}'`);
@@ -213,6 +223,8 @@ function RuleBuilder(ruleMap) {
 }
 
 function grammar(baseGrammar, options) {
+  let inherits = null;
+
   if (!options) {
     options = baseGrammar;
     baseGrammar = {
@@ -225,6 +237,9 @@ function grammar(baseGrammar, options) {
       supertypes: [],
       precedences: [],
     };
+  } else {
+    baseGrammar = baseGrammar.grammar;
+    inherits = baseGrammar.name;
   }
 
   let externals = baseGrammar.externals;
@@ -244,10 +259,10 @@ function grammar(baseGrammar, options) {
   }
 
   const ruleMap = {};
-  for (const key in options.rules) {
+  for (const key of Object.keys(options.rules)) {
     ruleMap[key] = true;
   }
-  for (const key in baseGrammar.rules) {
+  for (const key of Object.keys(baseGrammar.rules)) {
     ruleMap[key] = true;
   }
   for (const external of externals) {
@@ -267,16 +282,24 @@ function grammar(baseGrammar, options) {
     throw new Error("Grammar's 'name' property must not start with a digit and cannot contain non-word characters.");
   }
 
-  let rules = Object.assign({}, baseGrammar.rules);
+  if (inherits && typeof inherits !== "string") {
+    throw new Error("Base grammar's 'name' property must be a string.");
+  }
+
+  if (inherits && !/^[a-zA-Z_]\w*$/.test(name)) {
+    throw new Error("Base grammar's 'name' property must not start with a digit and cannot contain non-word characters.");
+  }
+
+  const rules = Object.assign({}, baseGrammar.rules);
   if (options.rules) {
     if (typeof options.rules !== "object") {
       throw new Error("Grammar's 'rules' property must be an object.");
     }
 
-    for (const ruleName in options.rules) {
+    for (const ruleName of Object.keys(options.rules)) {
       const ruleFn = options.rules[ruleName];
       if (typeof ruleFn !== "function") {
-        throw new Error("Grammar rules must all be functions. '" + ruleName + "' rule is not.");
+        throw new Error(`Grammar rules must all be functions. '${ruleName}' rule is not.`);
       }
       rules[ruleName] = normalize(ruleFn.call(ruleBuilder, ruleBuilder, baseGrammar.rules[ruleName]));
     }
@@ -303,6 +326,10 @@ function grammar(baseGrammar, options) {
     word = options.word.call(ruleBuilder, ruleBuilder).name;
     if (typeof word != 'string') {
       throw new Error("Grammar's 'word' property must be a named rule.");
+    }
+
+    if (word === 'ReferenceError') {
+      throw new Error("Grammar's 'word' property must be a valid rule name.");
     }
   }
 
@@ -341,7 +368,17 @@ function grammar(baseGrammar, options) {
       throw new Error("Grammar's inline must be an array of rules.");
     }
 
-    inline = inlineRules.map(symbol => symbol.name);
+    inline = inlineRules.filter((symbol, index, self) => {
+      if (self.findIndex(s => s.name === symbol.name) !== index) {
+        console.log(`Warning: duplicate inline rule '${symbol.name}'`);
+        return false;
+      }
+      if (symbol.name === 'ReferenceError') {
+        console.log(`Warning: inline rule '${symbol.symbol.name}' is not defined.`);
+        return false;
+      }
+      return true;
+    }).map(symbol => symbol.name);
   }
 
   let supertypes = baseGrammar.supertypes;
@@ -377,18 +414,36 @@ function grammar(baseGrammar, options) {
     });
   }
 
-  if (Object.keys(rules).length == 0) {
+  if (Object.keys(rules).length === 0) {
     throw new Error("Grammar must have at least one rule.");
   }
 
-  return {name, word, rules, extras, conflicts, precedences, externals, inline, supertypes};
+  return {
+    grammar: {
+      name,
+      ...(inherits ? ( inherits ) : {}),
+      word,
+      rules,
+      extras,
+      conflicts,
+      precedences,
+      externals,
+      inline,
+      supertypes,
+    },
+  };
 }
 
-function checkArguments(ruleCount, caller, callerName, suffix = '') {
-  if (ruleCount > 1) {
+function checkArguments(args, ruleCount, caller, callerName, suffix = '', argType = 'rule') {
+  // Allow for .map() usage where additional arguments are index and the entire array.
+  const isMapCall = ruleCount === 3 && typeof args[1] === 'number' && Array.isArray(args[2]);
+  if (isMapCall) {
+    ruleCount = typeof args[2] === 'number' ? 1 : args[2].length;
+  }
+  if (ruleCount > 1 && !isMapCall) {
     const error = new Error([
-      `The \`${callerName}\` function only takes one rule argument${suffix}.`,
-      'You passed multiple rules. Did you mean to call `seq`?\n'
+      `The \`${callerName}\` function only takes one ${argType} argument${suffix}.`,
+      `You passed in multiple ${argType}s. Did you mean to call \`seq\`?\n`
     ].join('\n'));
     Error.captureStackTrace(error, caller);
     throw error
@@ -415,4 +470,4 @@ global.grammar = grammar;
 global.field = field;
 
 const result = require(process.env.TREE_SITTER_GRAMMAR_PATH);
-console.log(JSON.stringify(result, null, 2));
+process.stdout.write(JSON.stringify(result.grammar, null, null));

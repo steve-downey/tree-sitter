@@ -1,13 +1,20 @@
+#![doc = include_str!("../README.md")]
+
 pub mod c_lib;
+
+use std::{
+    char,
+    collections::HashMap,
+    ffi::{CStr, CString},
+    mem,
+    ops::Range,
+    os::raw::c_char,
+    str,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use memchr::memchr;
 use regex::Regex;
-use std::collections::HashMap;
-use std::ffi::{CStr, CString};
-use std::ops::Range;
-use std::os::raw::c_char;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{char, mem, str};
 use thiserror::Error;
 use tree_sitter::{
     Language, LossyUtf8, Parser, Point, Query, QueryCursor, QueryError, QueryPredicateArg, Tree,
@@ -41,7 +48,7 @@ pub struct NamedCapture {
 }
 
 pub struct TagsContext {
-    parser: Parser,
+    pub parser: Parser,
     cursor: QueryCursor,
 }
 
@@ -115,7 +122,7 @@ struct LineInfo {
 
 impl TagsConfiguration {
     pub fn new(language: Language, tags_query: &str, locals_query: &str) -> Result<Self, Error> {
-        let query = Query::new(language, &format!("{}{}", locals_query, tags_query))?;
+        let query = Query::new(&language, &format!("{locals_query}{tags_query}"))?;
 
         let tags_query_offset = locals_query.len();
         let mut tags_pattern_index = 0;
@@ -134,14 +141,13 @@ impl TagsConfiguration {
         let mut local_scope_capture_index = None;
         let mut local_definition_capture_index = None;
         for (i, name) in query.capture_names().iter().enumerate() {
-            match name.as_str() {
-                "" => continue,
+            match *name {
                 "name" => name_capture_index = Some(i as u32),
                 "ignore" => ignore_capture_index = Some(i as u32),
                 "doc" => doc_capture_index = Some(i as u32),
                 "local.scope" => local_scope_capture_index = Some(i as u32),
                 "local.definition" => local_definition_capture_index = Some(i as u32),
-                "local.reference" => continue,
+                "local.reference" | "" => continue,
                 _ => {
                     let mut is_definition = false;
 
@@ -151,7 +157,7 @@ impl TagsConfiguration {
                     } else if name.starts_with("reference.") {
                         name.trim_start_matches("reference.")
                     } else {
-                        return Err(Error::InvalidCapture(name.to_string()));
+                        return Err(Error::InvalidCapture((*name).to_string()));
                     };
 
                     if let Ok(cstr) = CString::new(kind) {
@@ -198,7 +204,7 @@ impl TagsConfiguration {
                 }
                 if let Some(doc_capture_index) = doc_capture_index {
                     for predicate in query.general_predicates(pattern_index) {
-                        if predicate.args.get(0)
+                        if predicate.args.first()
                             == Some(&QueryPredicateArg::Capture(doc_capture_index))
                         {
                             match (predicate.operator.as_ref(), predicate.args.get(1)) {
@@ -214,11 +220,11 @@ impl TagsConfiguration {
                         }
                     }
                 }
-                return Ok(info);
+                Ok(info)
             })
             .collect::<Result<Vec<_>, Error>>()?;
 
-        Ok(TagsConfiguration {
+        Ok(Self {
             language,
             query,
             syntax_type_names,
@@ -227,26 +233,37 @@ impl TagsConfiguration {
             doc_capture_index,
             name_capture_index,
             ignore_capture_index,
-            tags_pattern_index,
             local_scope_capture_index,
             local_definition_capture_index,
+            tags_pattern_index,
             pattern_info,
         })
     }
 
+    #[must_use]
     pub fn syntax_type_name(&self, id: u32) -> &str {
         unsafe {
-            let cstr =
-                CStr::from_ptr(self.syntax_type_names[id as usize].as_ptr() as *const c_char)
-                    .to_bytes();
+            let cstr = CStr::from_ptr(
+                self.syntax_type_names[id as usize]
+                    .as_ptr()
+                    .cast::<c_char>(),
+            )
+            .to_bytes();
             str::from_utf8(cstr).expect("syntax type name was not valid utf-8")
         }
     }
 }
 
+impl Default for TagsContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TagsContext {
+    #[must_use]
     pub fn new() -> Self {
-        TagsContext {
+        Self {
             parser: Parser::new(),
             cursor: QueryCursor::new(),
         }
@@ -263,14 +280,15 @@ impl TagsContext {
         cancellation_flag: Option<&'a AtomicUsize>,
     ) -> Result<(impl Iterator<Item = Result<Tag, Error>> + 'a, bool), Error> {
         self.parser
-            .set_language(config.language)
+            .set_language(&config.language)
             .map_err(|_| Error::InvalidLanguage)?;
         self.parser.reset();
         unsafe { self.parser.set_cancellation_flag(cancellation_flag) };
         let tree = self.parser.parse(source, None).ok_or(Error::Cancelled)?;
 
-        // The `matches` iterator borrows the `Tree`, which prevents it from being moved.
-        // But the tree is really just a pointer, so it's actually ok to move it.
+        // The `matches` iterator borrows the `Tree`, which prevents it from being
+        // moved. But the tree is really just a pointer, so it's actually ok to
+        // move it.
         let tree_ref = unsafe { mem::transmute::<_, &'static Tree>(&tree) };
         let matches = self
             .cursor
@@ -325,9 +343,8 @@ where
                     let tag = self.tag_queue.remove(0).0;
                     if tag.is_ignored() {
                         continue;
-                    } else {
-                        return Some(Ok(tag));
                     }
+                    return Some(Ok(tag));
                 }
             }
 
@@ -445,16 +462,16 @@ where
                             }
                         }
 
-                        // Generate a doc string from all of the doc nodes, applying any strip regexes.
+                        // Generate a doc string from all of the doc nodes, applying any strip
+                        // regexes.
                         let mut docs = None;
                         for doc_node in &doc_nodes[docs_start_index..] {
                             if let Ok(content) = str::from_utf8(&self.source[doc_node.byte_range()])
                             {
-                                let content = if let Some(regex) = &pattern_info.doc_strip_regex {
-                                    regex.replace_all(content, "").to_string()
-                                } else {
-                                    content.to_string()
-                                };
+                                let content = pattern_info.doc_strip_regex.as_ref().map_or_else(
+                                    || content.to_string(),
+                                    |regex| regex.replace_all(content, "").to_string(),
+                                );
                                 match &mut docs {
                                     None => docs = Some(content),
                                     Some(d) => {
@@ -469,9 +486,9 @@ where
                         let range = rng.start.min(name_range.start)..rng.end.max(name_range.end);
                         let span = name_node.start_position()..name_node.end_position();
 
-                        // Compute tag properties that depend on the text of the containing line. If the
-                        // previous tag occurred on the same line, then reuse results from the previous tag.
-                        let line_range;
+                        // Compute tag properties that depend on the text of the containing line. If
+                        // the previous tag occurred on the same line, then
+                        // reuse results from the previous tag.
                         let mut prev_utf16_column = 0;
                         let mut prev_utf8_byte = name_range.start - span.start.column;
                         let line_info = self.prev_line_info.as_ref().and_then(|info| {
@@ -481,20 +498,20 @@ where
                                 None
                             }
                         });
-                        if let Some(line_info) = line_info {
-                            line_range = line_info.line_range.clone();
+                        let line_range = if let Some(line_info) = line_info {
                             if line_info.utf8_position.column <= span.start.column {
                                 prev_utf8_byte = line_info.utf8_byte;
                                 prev_utf16_column = line_info.utf16_column;
                             }
+                            line_info.line_range.clone()
                         } else {
-                            line_range = self::line_range(
+                            self::line_range(
                                 self.source,
                                 name_range.start,
                                 span.start,
                                 MAX_LINE_LEN,
-                            );
-                        }
+                            )
+                        };
 
                         let utf16_start_column = prev_utf16_column
                             + utf16_len(&self.source[prev_utf8_byte..name_range.start]);
@@ -509,11 +526,11 @@ where
                             line_range: line_range.clone(),
                         });
                         tag = Tag {
+                            range,
+                            name_range,
                             line_range,
                             span,
                             utf16_column_range,
-                            range,
-                            name_range,
                             docs,
                             is_definition,
                             syntax_type_id,
@@ -552,8 +569,9 @@ where
 }
 
 impl Tag {
-    fn ignored(name_range: Range<usize>) -> Self {
-        Tag {
+    #[must_use]
+    const fn ignored(name_range: Range<usize>) -> Self {
+        Self {
             name_range,
             line_range: 0..0,
             span: Point::new(0, 0)..Point::new(0, 0),
@@ -565,7 +583,8 @@ impl Tag {
         }
     }
 
-    fn is_ignored(&self) -> bool {
+    #[must_use]
+    const fn is_ignored(&self) -> bool {
         self.range.start == usize::MAX
     }
 }

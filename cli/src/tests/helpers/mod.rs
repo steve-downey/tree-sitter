@@ -5,9 +5,10 @@ pub(super) mod query_helpers;
 pub(super) mod random;
 pub(super) mod scope_sequence;
 
+use std::env;
+
 use lazy_static::lazy_static;
 use rand::Rng;
-use std::env;
 
 lazy_static! {
     pub static ref LOG_ENABLED: bool = env::var("TREE_SITTER_LOG").is_ok();
@@ -26,7 +27,7 @@ fn int_env_var(name: &'static str) -> Option<usize> {
     env::var(name).ok().and_then(|e| e.parse().ok())
 }
 
-pub(crate) fn new_seed() -> usize {
+pub fn new_seed() -> usize {
     int_env_var("TREE_SITTER_SEED").unwrap_or_else(|| {
         let mut rng = rand::thread_rng();
         rng.gen::<usize>()
